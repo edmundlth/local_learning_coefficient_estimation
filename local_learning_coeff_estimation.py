@@ -1,17 +1,17 @@
+import decimal
 import torch
 from copy import deepcopy
 import torch
 import numpy as np
 import time
+from engineering_notation import EngNumber
 
-
-class Experiment(object):
+class MNISTExperiment(object):
     def __init__(
         self,
         net,
         trainloader,
         testloader,
-        criterion,
         optimizer,
         device,
         sgld_num_chains=4,
@@ -22,7 +22,6 @@ class Experiment(object):
         self.net = net
         self.trainloader = trainloader
         self.testloader = testloader
-        self.criterion = criterion
         self.optimizer = optimizer
         self.device = device
 
@@ -37,10 +36,10 @@ class Experiment(object):
         self.trainloader_iter = iter(self.trainloader)
 
         self.records = {
-            "lfe": [], 
-            "energy": [], 
-            "hatlambda": [], 
-            "test_error": [], 
+            "lfe": [],
+            "energy": [],
+            "hatlambda": [],
+            "test_error": [],
             "train_error": []
         }
 
@@ -68,8 +67,8 @@ class Experiment(object):
     def closure(self):
         inputs, labels = self._generate_next_training_batch()
         self.optimizer.zero_grad()
-        outputs = self.net(inputs)
-        loss = self.criterion(outputs, labels)
+        outputs = self.net(inputs, labels=labels)
+        loss = outputs.loss
         loss.backward()
         return loss, inputs, labels
 
@@ -79,8 +78,8 @@ class Experiment(object):
         with torch.no_grad():
             for data in self.trainloader:
                 inputs, labels = data[0].to(self.device), data[1].to(self.device)
-                outputs = self.net(inputs)
-                loss = self.criterion(outputs, labels)
+                outputs = self.net(inputs, labels=labels)
+                loss = outputs.loss
                 energies.append(loss.item() * self.batch_size)
         return sum(energies)
 
@@ -92,20 +91,22 @@ class Experiment(object):
         if gamma is None:
             with torch.no_grad():
                 for name, param in model_copy.named_parameters():
-                    gamma_val = 100.0 / np.linalg.norm(param)
+                    gamma_val = 100.0 / torch.linalg.norm(param)
                     gamma_dict[name] = gamma_val
 
-        og_params = deepcopy(dict(model_copy.named_parameters()))
+
         chain_Lms = []
         for chain in range(num_chains):
+            model_copy = deepcopy(self.net)
+            og_params = deepcopy(dict(model_copy.named_parameters()))
             Lms = []
             for _ in range(num_iter):
                 with torch.enable_grad():
                     # call a minibatch loss backward
                     # so that we have gradient of average minibatch loss with respect to w'
                     inputs, labels = self._generate_next_training_batch()
-                    outputs = model_copy(inputs)
-                    loss = self.criterion(outputs, labels)
+                    outputs = model_copy(inputs, labels=labels)
+                    loss = outputs.loss
                     loss.backward()
                 for name, w in model_copy.named_parameters():
                     w_og = og_params[name]
@@ -130,10 +131,10 @@ class Experiment(object):
         if verbose:
             chain_std = np.std(self.total_train * np.mean(chain_Lms, axis=1))
             print(
-                f"LFE: {local_free_energy} (std: {chain_std}, n_chain={num_chains})"
+                f"LFE: {EngNumber(local_free_energy)} (std: {EngNumber(chain_std)}, n_chain={num_chains})"
             )
-        return local_free_energy
-    
+        return local_free_energy, chain_std
+
     def _record_epoch(self):
         local_free_energy, energy, hatlambda = self.compute_fenergy_energy_rlct()
         self.records["lfe"].append(local_free_energy)
@@ -156,19 +157,26 @@ class Experiment(object):
 
     def compute_fenergy_energy_rlct(self):
         energy = self.compute_energy()
-        local_free_energy = self.compute_local_free_energy(
+        local_free_energy, local_free_energy_std = self.compute_local_free_energy(
             self.sgld_num_iter,
             self.sgld_num_chains,
             self.sgld_gamma,
             self.sgld_noise_std,
         )
+        lfe_standard_error = local_free_energy_std/(self.sgld_num_chains)**0.5
+
+        local_free_energy_lower_bound = local_free_energy - lfe_standard_error*2
+        local_free_energy_upper_bound = local_free_energy + lfe_standard_error*2
+
         hatlambda = (local_free_energy - energy) / np.log(self.total_train)
-        return local_free_energy, energy, hatlambda
+        hatlambda_lower = (local_free_energy_lower_bound - energy) / np.log(self.total_train)
+        hatlambda_upper = (local_free_energy_upper_bound - energy) / np.log(self.total_train)
+        return local_free_energy, energy, hatlambda, hatlambda_lower, hatlambda_upper
 
     def run_entropy_sgd(self, esgd_L, num_epoch):
         print("Running Entropy-SGD optimizer")
         # errors, lfes, energies, lmbdas = [], [], [], []
-        
+
         for epoch in range(num_epoch):  # loop over the dataset multiple times
             start_time = time.time()
             for _ in range(len(self.trainloader) // esgd_L):
@@ -193,8 +201,8 @@ class Experiment(object):
                 self.optimizer.zero_grad()
 
                 # forward + backward + optimize
-                outputs = self.net(inputs)
-                loss = self.criterion(outputs, labels)
+                outputs = self.net(inputs, labels=labels)
+                loss = outputs.loss
                 loss.backward()
                 self.optimizer.step()
             self._record_epoch()
