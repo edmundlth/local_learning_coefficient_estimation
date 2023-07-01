@@ -85,7 +85,7 @@ class Experiment(object):
         return sum(energies)
 
     def compute_local_free_energy(
-        self, num_iter=100, num_chains=1, gamma=None, epsilon=1e-5, verbose=True
+        self, num_iter=100, num_chains=1, gamma=None, epsilon=1e-5, verbose=True, chain_itemps=None
     ):
         model_copy = deepcopy(self.net)
         gamma_dict = {}
@@ -94,10 +94,12 @@ class Experiment(object):
                 for name, param in model_copy.named_parameters():
                     gamma_val = 100.0 / np.linalg.norm(param)
                     gamma_dict[name] = gamma_val
-
+        if chain_itemps is None:
+            chain_itemps = []
         og_params = deepcopy(dict(model_copy.named_parameters()))
         chain_Lms = []
         for chain in range(num_chains):
+            model_copy = deepcopy(self.net)
             Lms = []
             for _ in range(num_iter):
                 with torch.enable_grad():
