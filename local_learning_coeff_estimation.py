@@ -5,6 +5,8 @@ import torch
 import numpy as np
 import time
 from engineering_notation import EngNumber
+from scipy.special import logsumexp
+
 
 class Experiment(object):
     def __init__(
@@ -35,12 +37,14 @@ class Experiment(object):
 
         self.trainloader_iter = iter(self.trainloader)
 
+        self.stateful_loader = None
+
         self.records = {
             "lfe": [],
             "energy": [],
             "hatlambda": [],
             "test_error": [],
-            "train_error": []
+            "train_error": [],
         }
 
     def eval(self, dataloader):
@@ -56,6 +60,12 @@ class Experiment(object):
         return correct / total
 
     def _generate_next_training_batch(self):
+        """
+        Generate a batch of data from the trainloader for iterative process that
+        doesn't necessarily loop through the entire dataset.
+        We are making a stateful iterator here and refresh the iterator when it hits
+        StopIteration.
+        """
         try:
             data = next(self.trainloader_iter)
         except StopIteration:
@@ -83,8 +93,60 @@ class Experiment(object):
                 energies.append(loss.item() * self.batch_size)
         return sum(energies)
 
+    def _generate_next_batch(self, dataloader):
+        if self.stateful_loader is None:
+            self.stateful_loader = iter(dataloader)
+        try:
+            data = next(self.stateful_loader)
+        except StopIteration:
+            self.stateful_loader = iter(dataloader)
+            data = next(self.stateful_loader)
+        inputs, labels = data[0].to(self.device), data[1].to(self.device)
+        return inputs, labels
+
+    def run_sgld_chains(self, num_iter, dataloader, gamma=None, epsilon=1e-5):
+        model_copy = deepcopy(self.net)
+        gamma_dict = {}
+        if gamma is None:
+            with torch.no_grad():
+                for name, param in model_copy.named_parameters():
+                    gamma_val = 100.0 / torch.linalg.norm(param)
+                    gamma_dict[name] = gamma_val
+        og_params = deepcopy(dict(model_copy.named_parameters()))
+
+        losses = []
+        for _ in range(num_iter):
+            with torch.enable_grad():
+                # call a minibatch loss backward
+                # so that we have gradient of average minibatch loss with respect to w'
+                inputs, labels = self._generate_next_batch(dataloader)
+                outputs = model_copy(inputs, labels=labels)
+                loss = outputs.loss
+                loss.backward()
+            for name, w in model_copy.named_parameters():
+                w_og = og_params[name]
+                dw = -w.grad.data / np.log(self.total_train) * self.total_train
+                if gamma is None:
+                    prior_weight = gamma_dict[name]
+                else:
+                    prior_weight = gamma
+                dw.add_(w.data - w_og.data, alpha=-prior_weight)
+                w.data.add_(dw, alpha=epsilon / 2)
+                gaussian_noise = torch.empty_like(w)
+                gaussian_noise.normal_()
+                w.data.add_(gaussian_noise, alpha=np.sqrt(epsilon))
+                w.grad.zero_()
+
+            yield model_copy
+
     def compute_local_free_energy(
-        self, num_iter=100, num_chains=1, gamma=None, epsilon=1e-5, verbose=True, chain_itemps=None
+        self,
+        num_iter=100,
+        num_chains=1,
+        gamma=None,
+        epsilon=1e-5,
+        verbose=True,
+        chain_itemps=None,
     ):
         model_copy = deepcopy(self.net)
         gamma_dict = {}
@@ -96,7 +158,6 @@ class Experiment(object):
         if chain_itemps is None:
             chain_itemps = []
         og_params = deepcopy(dict(model_copy.named_parameters()))
-
 
         chain_Lms = []
         for chain in range(num_chains):
@@ -165,14 +226,18 @@ class Experiment(object):
             self.sgld_gamma,
             self.sgld_noise_std,
         )
-        lfe_standard_error = local_free_energy_std/(self.sgld_num_chains)**0.5
+        lfe_standard_error = local_free_energy_std / (self.sgld_num_chains) ** 0.5
 
-        local_free_energy_lower_bound = local_free_energy - lfe_standard_error*2
-        local_free_energy_upper_bound = local_free_energy + lfe_standard_error*2
+        local_free_energy_lower_bound = local_free_energy - lfe_standard_error * 2
+        local_free_energy_upper_bound = local_free_energy + lfe_standard_error * 2
 
         hatlambda = (local_free_energy - energy) / np.log(self.total_train)
-        hatlambda_lower = (local_free_energy_lower_bound - energy) / np.log(self.total_train)
-        hatlambda_upper = (local_free_energy_upper_bound - energy) / np.log(self.total_train)
+        hatlambda_lower = (local_free_energy_lower_bound - energy) / np.log(
+            self.total_train
+        )
+        hatlambda_upper = (local_free_energy_upper_bound - energy) / np.log(
+            self.total_train
+        )
         return local_free_energy, energy, hatlambda, hatlambda_lower, hatlambda_upper
 
     def run_entropy_sgd(self, esgd_L, num_epoch):
@@ -186,7 +251,9 @@ class Experiment(object):
                 # division by L is to make the same number of passes as plain SGD below
                 self.optimizer.step(self.closure)
             self._record_epoch()
-            print(f"Finished epoch {epoch + 1} / {num_epoch}, time taken: {time.time() - start_time:.3f}")
+            print(
+                f"Finished epoch {epoch + 1} / {num_epoch}, time taken: {time.time() - start_time:.3f}"
+            )
         return self.records
 
     def run_sgd(self, num_epoch):
@@ -208,5 +275,35 @@ class Experiment(object):
                 loss.backward()
                 self.optimizer.step()
             self._record_epoch()
-            print(f"Finished epoch {epoch + 1} / {num_epoch}, time taken: {time.time() - start_time:.3f}")
+            print(
+                f"Finished epoch {epoch + 1} / {num_epoch}, time taken: {time.time() - start_time:.3f}"
+            )
         return self.records
+
+    def compute_bayes_loss(self, dataloader, num_sgld_iter=50):
+        rec = []
+        for data in dataloader:
+            inputs, labels = data[0].to(self.device), data[1].to(self.device)
+            # we are approximating logsumexp(array, b=1/m) with max(array - log(m))
+            max_val = -np.inf
+            for model_copy in self.run_sgld_chains(num_sgld_iter):
+                outputs = model_copy(inputs, labels=labels)
+                val = outputs.loss - np.log(num_sgld_iter)
+                if val > max_val:
+                    max_val = val
+            rec.append(max_val)
+        return -np.mean(rec)
+
+    def compute_gibbs_loss(self, dataloader, num_sgld_iter=50):
+        avg_losses = []
+        for model_copy in self.run_sgld_chains(num_sgld_iter):
+            losses = []
+            for data in dataloader:
+                inputs, labels = data[0].to(self.device), data[1].to(self.device)
+                outputs = model_copy(inputs, labels=labels)
+                losses.append(outputs.loss)
+            avg_losses.append(np.mean(losses))
+        return -np.mean(avg_losses)
+
+    def compute_waic(self):
+        raise NotImplementedError
