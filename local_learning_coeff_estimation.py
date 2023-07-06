@@ -284,14 +284,19 @@ class Experiment(object):
         rec = []
         for data in dataloader:
             inputs, labels = data[0].to(self.device), data[1].to(self.device)
-            # we are approximating logsumexp(array, b=1/m) with max(array - log(m))
-            max_val = -np.inf
+            # using `log(sum(exp(array)) / m) = log(sum(exp(array - max(array))) / m) + max(array)`
+            # to pre-emptively avoid overflow errors. Probably this is a non-issue in this application,
+            # but why not?
+            val_array = []
             for model_copy in self.run_sgld_chains(num_sgld_iter):
                 outputs = model_copy(inputs, labels=labels)
-                val = outputs.loss - np.log(num_sgld_iter)
-                if val > max_val:
-                    max_val = val
-            rec.append(max_val)
+                val = outputs.loss
+                val_array.append(val)
+            
+            max_val = max(val_array)
+            val_array = torch.tensor(val_array)
+            lse = torch.logsumexp(val_array - max_val, dim=0) + max_val - np.log(num_sgld_iter)
+            rec.append(lse.item())
         return -np.mean(rec)
 
     def compute_gibbs_loss(self, dataloader, num_sgld_iter=50):
