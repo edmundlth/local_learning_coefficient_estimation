@@ -4,8 +4,8 @@ from copy import deepcopy
 import torch
 import numpy as np
 import time
-from engineering_notation import EngNumber
 from scipy.special import logsumexp
+import functools
 
 
 class Experiment(object):
@@ -81,7 +81,8 @@ class Experiment(object):
         loss = outputs.loss
         loss.backward()
         return loss, inputs, labels
-
+        
+    @functools.lru_cache(maxsize=128)
     def compute_energy(self):
         # this is nL_n,k, sum of the losses at w^* found so far
         energies = []
@@ -194,7 +195,7 @@ class Experiment(object):
         if verbose:
             chain_std = np.std(self.total_train * np.mean(chain_Lms, axis=1))
             print(
-                f"LFE: {EngNumber(local_free_energy)} (std: {EngNumber(chain_std)}, n_chain={num_chains})"
+                f"LFE: {local_free_energy:.2e} (std: {chain_std:.2e}, n_chain={num_chains})"
             )
         return local_free_energy, chain_std
 
