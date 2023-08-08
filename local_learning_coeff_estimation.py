@@ -1,11 +1,13 @@
 import decimal
 import torch
+import torch.nn as nn
 from copy import deepcopy
 import torch
 import numpy as np
 import time
 from engineering_notation import EngNumber
 from scipy.special import logsumexp
+import gc
 
 
 class Experiment(object):
@@ -16,6 +18,7 @@ class Experiment(object):
         testloader,
         optimizer,
         device,
+        loss_fn=None,
         sgld_num_chains=4,
         sgld_num_iter=100,
         sgld_gamma=None,
@@ -26,6 +29,14 @@ class Experiment(object):
         self.testloader = testloader
         self.optimizer = optimizer
         self.device = device
+        if loss_fn is None:
+            # for BERT model compatibility
+            self.loss_fn = lambda outputs, labels: outputs.loss 
+            self._wrapped_forward = lambda net, inputs, labels: net(inputs, labels=labels)
+        else:
+            # this is for MNIST or other classification tasks. 
+            self.loss_fn = loss_fn
+            self._wrapped_forward = lambda net, inputs, labels: net(inputs)
 
         self.sgld_num_chains = sgld_num_chains
         self.sgld_num_iter = sgld_num_iter
@@ -38,6 +49,15 @@ class Experiment(object):
         self.trainloader_iter = iter(self.trainloader)
 
         self.stateful_loader = None
+        self.all_inputs = []
+        self.all_labels = []
+        # get all training data
+        for batch_data, batch_labels in iter(self.trainloader):
+            self.all_inputs.append(batch_data)
+            self.all_labels.append(batch_labels)
+        self.all_inputs = torch.cat(self.all_inputs).to(self.device)
+        self.all_labels = torch.cat(self.all_labels).to(self.device)
+
 
         self.records = {
             "lfe": [],
@@ -45,7 +65,12 @@ class Experiment(object):
             "hatlambda": [],
             "test_error": [],
             "train_error": [],
+            "hatlambda_lower": [],
+            "hatlambda_upper": [],
+            "func_var": [], 
+            "nu": []
         }
+    
 
     def eval(self, dataloader):
         correct = 0
@@ -53,7 +78,7 @@ class Experiment(object):
         with torch.no_grad():
             for data in dataloader:
                 inputs, labels = data[0].to(self.device), data[1].to(self.device)
-                outputs = self.net(inputs)
+                outputs = self._wrapped_forward(self.net, inputs, labels)
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
@@ -77,8 +102,8 @@ class Experiment(object):
     def closure(self):
         inputs, labels = self._generate_next_training_batch()
         self.optimizer.zero_grad()
-        outputs = self.net(inputs, labels=labels)
-        loss = outputs.loss
+        outputs = self._wrapped_forward(self.net, inputs, labels)
+        loss = self.loss_fn(outputs, labels)
         loss.backward()
         return loss, inputs, labels
 
@@ -88,8 +113,8 @@ class Experiment(object):
         with torch.no_grad():
             for data in self.trainloader:
                 inputs, labels = data[0].to(self.device), data[1].to(self.device)
-                outputs = self.net(inputs, labels=labels)
-                loss = outputs.loss
+                outputs = self._wrapped_forward(self.net, inputs, labels)
+                loss = self.loss_fn(outputs, labels)
                 energies.append(loss.item() * self.batch_size)
         return sum(energies)
 
@@ -104,7 +129,9 @@ class Experiment(object):
         inputs, labels = data[0].to(self.device), data[1].to(self.device)
         return inputs, labels
 
-    def run_sgld_chains(self, num_iter, dataloader, gamma=None, epsilon=1e-5):
+    def run_sgld_chains(self, num_iter, dataloader, gamma=None, epsilon=1e-5, itemp=None):
+        if itemp is None:
+            itemp = 1 / np.log(self.total_train)
         model_copy = deepcopy(self.net)
         gamma_dict = {}
         if gamma is None:
@@ -114,18 +141,18 @@ class Experiment(object):
                     gamma_dict[name] = gamma_val
         og_params = deepcopy(dict(model_copy.named_parameters()))
 
-        losses = []
         for _ in range(num_iter):
             with torch.enable_grad():
                 # call a minibatch loss backward
                 # so that we have gradient of average minibatch loss with respect to w'
                 inputs, labels = self._generate_next_batch(dataloader)
-                outputs = model_copy(inputs, labels=labels)
-                loss = outputs.loss
+                outputs = self._wrapped_forward(model_copy, inputs, labels)
+                # outputs = model_copy(inputs, labels=labels)
+                loss = self.loss_fn(outputs, labels)
                 loss.backward()
             for name, w in model_copy.named_parameters():
                 w_og = og_params[name]
-                dw = -w.grad.data / np.log(self.total_train) * self.total_train
+                dw = -w.grad.data * self.total_train * itemp
                 if gamma is None:
                     prior_weight = gamma_dict[name]
                 else:
@@ -138,6 +165,28 @@ class Experiment(object):
                 w.grad.zero_()
 
             yield model_copy
+
+    def compute_functional_variance(self, num_iter=100, num_chains=1, gamma=100.0, epsilon=1e-5):
+        print("Compute functional variance.")
+        with torch.no_grad():
+            loss_fn_noreduce = nn.CrossEntropyLoss(reduction='none')
+            m = 0
+            loss_sum = torch.zeros(len(self.all_inputs))
+            loss_sum_sq = torch.zeros(len(self.all_inputs))
+            for _ in range(num_chains):
+                sgld_generator = self.run_sgld_chains(num_iter=num_iter, dataloader=self.trainloader, gamma=gamma, epsilon=epsilon, itemp=1.0)
+                for model_copy in sgld_generator:
+                    m += 1
+                    outputs = self._wrapped_forward(model_copy, self.all_inputs, self.all_labels)
+                    losses = loss_fn_noreduce(outputs, self.all_labels)
+                    loss_sum += losses
+                    loss_sum_sq += losses * losses
+            variance = (loss_sum_sq - loss_sum * loss_sum / m) / (m - 1)
+            func_var = torch.sum(variance)
+            print(variance[:5])
+            print(func_var / 2)
+        return func_var
+        
 
     def compute_local_free_energy(
         self,
@@ -168,8 +217,8 @@ class Experiment(object):
                     # call a minibatch loss backward
                     # so that we have gradient of average minibatch loss with respect to w'
                     inputs, labels = self._generate_next_training_batch()
-                    outputs = model_copy(inputs, labels=labels)
-                    loss = outputs.loss
+                    outputs = self._wrapped_forward(model_copy, inputs, labels)
+                    loss = self.loss_fn(outputs, labels)
                     loss.backward()
                 for name, w in model_copy.named_parameters():
                     w_og = og_params[name]
@@ -199,22 +248,34 @@ class Experiment(object):
         return local_free_energy, chain_std
 
     def _record_epoch(self):
-        local_free_energy, energy, hatlambda = self.compute_fenergy_energy_rlct()
+        local_free_energy, energy, hatlambda, hatlambda_lower, hatlambda_upper = self.compute_fenergy_energy_rlct()
+        func_var = self.compute_functional_variance(
+            num_iter=self.sgld_num_iter,
+            num_chains=self.sgld_num_chains,
+            gamma=self.sgld_gamma,
+            epsilon=self.sgld_noise_std,
+        )
+        func_var = float(func_var.item())
+        nu = func_var / 2
         self.records["lfe"].append(local_free_energy)
         self.records["energy"].append(energy)
         self.records["hatlambda"].append(hatlambda)
+        self.records["func_var"].append(func_var)
+        self.records["nu"].append(nu)
         test_err = 1 - self.eval(self.testloader)
         train_err = 1 - self.eval(self.trainloader)
 
         self.records["test_error"].append(test_err)
         self.records["train_error"].append(train_err)
+        self.records["hatlambda_lower"].append(hatlambda_lower)
+        self.records["hatlambda_upper"].append(hatlambda_upper)
         epoch = len(self.records["test_error"])
         print(
             f"Epoch: {epoch} "
             f"energy: {energy:.4f} "
             f"hatlambda: {hatlambda:.4f} "
-            f"test error: {test_err:.4f} "
-            f"train error: {train_err:.4f} "
+            f"test error: {np.format_float_scientific(test_err, precision=3)} "
+            f"train error: {np.format_float_scientific(train_err, precision=3)} "
         )
         return
 
@@ -270,8 +331,8 @@ class Experiment(object):
                 self.optimizer.zero_grad()
 
                 # forward + backward + optimize
-                outputs = self.net(inputs, labels=labels)
-                loss = outputs.loss
+                outputs = self._wrapped_forward(self.net, inputs, labels)
+                loss = self.loss_fn(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
             self._record_epoch()
@@ -287,8 +348,8 @@ class Experiment(object):
             # we are approximating logsumexp(array, b=1/m) with max(array - log(m))
             max_val = -np.inf
             for model_copy in self.run_sgld_chains(num_sgld_iter):
-                outputs = model_copy(inputs, labels=labels)
-                val = outputs.loss - np.log(num_sgld_iter)
+                outputs = self._wrapped_forward(model_copy, inputs, labels)
+                val = self.loss_fn(outputs, labels) - np.log(num_sgld_iter)
                 if val > max_val:
                     max_val = val
             rec.append(max_val)
@@ -300,8 +361,8 @@ class Experiment(object):
             losses = []
             for data in dataloader:
                 inputs, labels = data[0].to(self.device), data[1].to(self.device)
-                outputs = model_copy(inputs, labels=labels)
-                losses.append(outputs.loss)
+                outputs = self._wrapped_forward(model_copy, inputs, labels)
+                losses.append(self.loss_fn(outputs, labels))
             avg_losses.append(np.mean(losses))
         return -np.mean(avg_losses)
 

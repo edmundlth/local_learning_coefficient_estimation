@@ -8,9 +8,13 @@ torch = "*"
 numpy = "*"
 scipy = "*"
 engineering-notation = "*"
+torchvision = "*"
+matplotlib = "*"
+sacred = "*"
 
 [dev-packages]
 black = "*"
+jupyter = "*"
 
 [requires]
 python_version = "3.9"
