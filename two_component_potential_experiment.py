@@ -19,9 +19,10 @@ from sgld_2d_validation import (
 )
 
 
-K1, K2 = 1, 1
+
 def run_experiment(expt_config):
     # Initialize parameters for the experiment
+    K1, K2 = expt_config["exponents"]
     sampler_type = expt_config["sampler"]
     sigma = expt_config["sigma"]
     prior_sigma = expt_config["prior_sigma"]
@@ -69,7 +70,9 @@ def run_experiment(expt_config):
 if __name__ == "__main__":
     parser = parse_commandline()
     parser.add_argument("--num_repeat", help="number of repeated experiments using successive random.split of the rng key.", type=int, default=1)
+    parser.add_argument("--exponents", type=int, nargs="*", default=[1, 2])
     args = parser.parse_args()
+    K1, K2 = args.exponents
 
     print(f"Commandline arguments:\n{vars(args)}")
     if args.outputdir:
@@ -78,6 +81,7 @@ if __name__ == "__main__":
     keys = random.split(random.PRNGKey(args.seeds[0]), num=args.num_repeat)
     
     config_dict = {
+            "exponents": args.exponents,
             "num_training_data": args.num_training_data, 
             "sigma": args.sigma, 
             "prior_sigma": args.prior_sigma, 

@@ -10,14 +10,16 @@ import json
 import os
 import concurrent
 
+from EntropySGD import EntropySGD
 from utils import common_cmd_parser
 from local_learning_coeff_estimation import Experiment
 
 
 # TODO:
-#  - [ ] Vary `n`. Plot estimated RLCT against `n` and see if it stabilise. 
-#  - [ ] Sensitivity analysis on the main hyperparameters: sgld_gamma, sgld_noise_std, sgld_num_iter. 
-# - [ ] Might need to implement accept-reject step to SGLD sampling. Random Gaussian noise added to very high dimensional space might result in points with very high potential energy. This might be cause of the observed massive variance of lambda hat when `sgld_noise_std` is varied. 
+# - [ ] Vary `n`. Plot estimated RLCT against `n` and see if it stabilise.
+# - [x] Sensitivity analysis on the main hyperparameters: sgld_gamma, sgld_noise_std, sgld_num_iter.
+# - [ ] Might need to implement accept-reject step to SGLD sampling. Random Gaussian noise added to very high dimensional space might result in points with very high potential energy. This might be cause of the observed massive variance of lambda hat when `sgld_noise_std` is varied.
+
 
 class MNISTNet(nn.Module):
     def __init__(
@@ -81,6 +83,12 @@ def parse_commandline():
         help="Maximum number of parallel process running the experiments independently for each given rngseed",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--esgd_L",
+        help="The L parameter to be used by the EntropySGD optimiser",
+        type=int,
+        default=5,
     )
     return parser
 
@@ -182,15 +190,33 @@ def main(args, rngseed):
             net,
             trainloader,
             testloader,
-            criterion,
             optimizer,
             device,
+            loss_fn=criterion,
             sgld_num_chains=args.sgld_num_chains,
             sgld_num_iter=args.sgld_num_iter,
             sgld_gamma=args.sgld_gamma,
             sgld_noise_std=args.sgld_noise_std,
         )
         experiment.run_sgd(num_epoch)
+    elif args.optimizer.lower() in ["entropy-sgd", "esgd"]:
+        optimizer = EntropySGD(
+            net.parameters(), eta=args.lr, momentum=0.9, nesterov=False, L=args.esgd_L
+        )
+        print(device)
+        experiment = Experiment(
+            net,
+            trainloader,
+            testloader,
+            optimizer,
+            device,
+            loss_fn=criterion,
+            sgld_num_chains=args.sgld_num_chains,
+            sgld_num_iter=args.sgld_num_iter,
+            sgld_gamma=args.sgld_gamma,
+            sgld_noise_std=args.sgld_noise_std,
+        )
+        experiment.run_entropy_sgd(args.esgd_L, num_epoch)
 
     print("Finished Training")
     # _map_float = lambda x: list(map(float, x))
@@ -254,7 +280,6 @@ def main(args, rngseed):
     ax.set_ylabel("percent error")
     ax.legend()
 
-    
     if args.outputdir is not None:
         print("Saving plots....")
         fig.savefig(_get_save_filepath("plots.png"))

@@ -36,7 +36,7 @@ def common_cmd_parser():
         "--num_gradient_step",
         help="Total number of gradient steps taken. If specified, ignore --epoch and calculate epoch number from dataset size and batch size.",
         type=int,
-        default=1000,
+        default=None,
     )
     parser.add_argument(
         "--optimizer", help="sgd | entropy-sgd | adam", type=str, default="sgd"

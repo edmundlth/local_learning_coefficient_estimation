@@ -31,10 +31,12 @@ class Experiment(object):
         self.device = device
         if loss_fn is None:
             # for BERT model compatibility
-            self.loss_fn = lambda outputs, labels: outputs.loss 
-            self._wrapped_forward = lambda net, inputs, labels: net(inputs, labels=labels)
+            self.loss_fn = lambda outputs, labels: outputs.loss
+            self._wrapped_forward = lambda net, inputs, labels: net(
+                inputs, labels=labels
+            )
         else:
-            # this is for MNIST or other classification tasks. 
+            # this is for MNIST or other classification tasks.
             self.loss_fn = loss_fn
             self._wrapped_forward = lambda net, inputs, labels: net(inputs)
 
@@ -47,30 +49,25 @@ class Experiment(object):
         self.total_train = len(self.trainloader.dataset)
 
         self.trainloader_iter = iter(self.trainloader)
-
         self.stateful_loader = None
+
+        # TODO: THIS IS A HACK. We are just storing these in memory to use in computing functional variance.
         self.all_inputs = []
         self.all_labels = []
         # get all training data
         for batch_data, batch_labels in iter(self.trainloader):
             self.all_inputs.append(batch_data)
             self.all_labels.append(batch_labels)
+        print(self.device)
         self.all_inputs = torch.cat(self.all_inputs).to(self.device)
         self.all_labels = torch.cat(self.all_labels).to(self.device)
+        self.records = {}
 
-
-        self.records = {
-            "lfe": [],
-            "energy": [],
-            "hatlambda": [],
-            "test_error": [],
-            "train_error": [],
-            "hatlambda_lower": [],
-            "hatlambda_upper": [],
-            "func_var": [], 
-            "nu": []
-        }
-    
+    def save_to_epoch_record(self, key, value):
+        if key not in self.records:
+            self.records[key] = []
+        self.records[key].append(value)
+        return
 
     def eval(self, dataloader):
         correct = 0
@@ -98,6 +95,17 @@ class Experiment(object):
             data = next(self.trainloader_iter)
         inputs, labels = data[0].to(self.device), data[1].to(self.device)
         return inputs, labels
+    
+    def _generate_next_batch(self, dataloader):
+        if self.stateful_loader is None:
+            self.stateful_loader = iter(dataloader)
+        try:
+            data = next(self.stateful_loader)
+        except StopIteration:
+            self.stateful_loader = iter(dataloader)
+            data = next(self.stateful_loader)
+        inputs, labels = data[0].to(self.device), data[1].to(self.device)
+        return inputs, labels
 
     def closure(self):
         inputs, labels = self._generate_next_training_batch()
@@ -115,21 +123,12 @@ class Experiment(object):
                 inputs, labels = data[0].to(self.device), data[1].to(self.device)
                 outputs = self._wrapped_forward(self.net, inputs, labels)
                 loss = self.loss_fn(outputs, labels)
-                energies.append(loss.item() * self.batch_size)
+                energies.append(loss.item() * inputs.shape[0])
         return sum(energies)
 
-    def _generate_next_batch(self, dataloader):
-        if self.stateful_loader is None:
-            self.stateful_loader = iter(dataloader)
-        try:
-            data = next(self.stateful_loader)
-        except StopIteration:
-            self.stateful_loader = iter(dataloader)
-            data = next(self.stateful_loader)
-        inputs, labels = data[0].to(self.device), data[1].to(self.device)
-        return inputs, labels
-
-    def run_sgld_chains(self, num_iter, dataloader, gamma=None, epsilon=1e-5, itemp=None):
+    def run_sgld_chains(
+        self, num_iter, dataloader, gamma=None, epsilon=1e-5, itemp=None
+    ):
         if itemp is None:
             itemp = 1 / np.log(self.total_train)
         model_copy = deepcopy(self.net)
@@ -147,7 +146,6 @@ class Experiment(object):
                 # so that we have gradient of average minibatch loss with respect to w'
                 inputs, labels = self._generate_next_batch(dataloader)
                 outputs = self._wrapped_forward(model_copy, inputs, labels)
-                # outputs = model_copy(inputs, labels=labels)
                 loss = self.loss_fn(outputs, labels)
                 loss.backward()
             for name, w in model_copy.named_parameters():
@@ -163,30 +161,36 @@ class Experiment(object):
                 gaussian_noise.normal_()
                 w.data.add_(gaussian_noise, alpha=np.sqrt(epsilon))
                 w.grad.zero_()
-
             yield model_copy
 
-    def compute_functional_variance(self, num_iter=100, num_chains=1, gamma=100.0, epsilon=1e-5):
+    def compute_functional_variance(
+        self, num_iter=100, num_chains=1, gamma=100.0, epsilon=1e-5
+    ):
         print("Compute functional variance.")
         with torch.no_grad():
-            loss_fn_noreduce = nn.CrossEntropyLoss(reduction='none')
+            loss_fn_noreduce = nn.CrossEntropyLoss(reduction="none")
             m = 0
             loss_sum = torch.zeros(len(self.all_inputs))
             loss_sum_sq = torch.zeros(len(self.all_inputs))
             for _ in range(num_chains):
-                sgld_generator = self.run_sgld_chains(num_iter=num_iter, dataloader=self.trainloader, gamma=gamma, epsilon=epsilon, itemp=1.0)
+                sgld_generator = self.run_sgld_chains(
+                    num_iter=num_iter,
+                    dataloader=self.trainloader,
+                    gamma=gamma,
+                    epsilon=epsilon,
+                    itemp=1.0,
+                )
                 for model_copy in sgld_generator:
                     m += 1
-                    outputs = self._wrapped_forward(model_copy, self.all_inputs, self.all_labels)
+                    outputs = self._wrapped_forward(
+                        model_copy, self.all_inputs, self.all_labels
+                    )
                     losses = loss_fn_noreduce(outputs, self.all_labels)
                     loss_sum += losses
                     loss_sum_sq += losses * losses
             variance = (loss_sum_sq - loss_sum * loss_sum / m) / (m - 1)
             func_var = torch.sum(variance)
-            print(variance[:5])
-            print(func_var / 2)
         return func_var
-        
 
     def compute_local_free_energy(
         self,
@@ -194,49 +198,30 @@ class Experiment(object):
         num_chains=1,
         gamma=None,
         epsilon=1e-5,
+        itemp=None,
         verbose=True,
-        chain_itemps=None,
     ):
-        model_copy = deepcopy(self.net)
-        gamma_dict = {}
-        if gamma is None:
-            with torch.no_grad():
-                for name, param in model_copy.named_parameters():
-                    gamma_val = 100.0 / torch.linalg.norm(param)
-                    gamma_dict[name] = gamma_val
-        if chain_itemps is None:
-            chain_itemps = []
-        og_params = deepcopy(dict(model_copy.named_parameters()))
-
-        chain_Lms = []
-        for chain in range(num_chains):
-            model_copy = deepcopy(self.net)
-            Lms = []
-            for _ in range(num_iter):
-                with torch.enable_grad():
-                    # call a minibatch loss backward
-                    # so that we have gradient of average minibatch loss with respect to w'
+        if itemp is None:
+            itemp = 1 / np.log(self.total_train)
+        with torch.no_grad():
+            chain_Lms = []
+            for chain in range(num_chains):
+                sgld_generator = self.run_sgld_chains(
+                    num_iter=num_iter,
+                    dataloader=self.trainloader,
+                    gamma=gamma,
+                    epsilon=epsilon,
+                    itemp=itemp,
+                )
+                Lms = []
+                for model_copy in sgld_generator:
                     inputs, labels = self._generate_next_training_batch()
                     outputs = self._wrapped_forward(model_copy, inputs, labels)
                     loss = self.loss_fn(outputs, labels)
-                    loss.backward()
-                for name, w in model_copy.named_parameters():
-                    w_og = og_params[name]
-                    dw = -w.grad.data / np.log(self.total_train) * self.total_train
-                    if gamma is None:
-                        prior_weight = gamma_dict[name]
-                    else:
-                        prior_weight = gamma
-                    dw.add_(w.data - w_og.data, alpha=-prior_weight)
-                    w.data.add_(dw, alpha=epsilon / 2)
-                    gaussian_noise = torch.empty_like(w)
-                    gaussian_noise.normal_()
-                    w.data.add_(gaussian_noise, alpha=np.sqrt(epsilon))
-                    w.grad.zero_()
-                Lms.append(loss.item())
-            chain_Lms.append(Lms)
-            if verbose:
-                print(f"Chain {chain + 1}: L_m = {np.mean(Lms)}")
+                    Lms.append(loss.item())
+                chain_Lms.append(Lms)
+                if verbose:
+                    print(f"Chain {chain + 1}: L_m = {np.mean(Lms)}")
 
         chain_Lms = np.array(chain_Lms)
         local_free_energy = self.total_train * np.mean(chain_Lms)
@@ -247,28 +232,92 @@ class Experiment(object):
             )
         return local_free_energy, chain_std
 
+    # def compute_local_free_energy2(
+    #     self,
+    #     num_iter=100,
+    #     num_chains=1,
+    #     gamma=None,
+    #     epsilon=1e-5,
+    #     verbose=True,
+    # ):
+    #     model_copy = deepcopy(self.net)
+    #     gamma_dict = {}
+    #     if gamma is None:
+    #         with torch.no_grad():
+    #             for name, param in model_copy.named_parameters():
+    #                 gamma_val = 100.0 / torch.linalg.norm(param)
+    #                 gamma_dict[name] = gamma_val
+
+    #     og_params = deepcopy(dict(model_copy.named_parameters()))
+    #     chain_Lms = []
+    #     for chain in range(num_chains):
+    #         model_copy = deepcopy(self.net)
+    #         Lms = []
+    #         for _ in range(num_iter):
+    #             with torch.enable_grad():
+    #                 # call a minibatch loss backward
+    #                 # so that we have gradient of average minibatch loss with respect to w'
+    #                 inputs, labels = self._generate_next_training_batch()
+    #                 outputs = self._wrapped_forward(model_copy, inputs, labels)
+    #                 loss = self.loss_fn(outputs, labels)
+    #                 loss.backward()
+    #             for name, w in model_copy.named_parameters():
+    #                 w_og = og_params[name]
+    #                 dw = -w.grad.data / np.log(self.total_train) * self.total_train
+    #                 if gamma is None:
+    #                     prior_weight = gamma_dict[name]
+    #                 else:
+    #                     prior_weight = gamma
+    #                 dw.add_(w.data - w_og.data, alpha=-prior_weight)
+    #                 w.data.add_(dw, alpha=epsilon / 2)
+    #                 gaussian_noise = torch.empty_like(w)
+    #                 gaussian_noise.normal_()
+    #                 w.data.add_(gaussian_noise, alpha=np.sqrt(epsilon))
+    #                 w.grad.zero_()
+    #             Lms.append(loss.item())
+    #         chain_Lms.append(Lms)
+    #         if verbose:
+    #             print(f"Chain {chain + 1}: L_m = {np.mean(Lms)}")
+
+    #     chain_Lms = np.array(chain_Lms)
+    #     local_free_energy = self.total_train * np.mean(chain_Lms)
+    #     if verbose:
+    #         chain_std = np.std(self.total_train * np.mean(chain_Lms, axis=1))
+    #         print(
+    #             f"LFE: {EngNumber(local_free_energy)} (std: {EngNumber(chain_std)}, n_chain={num_chains})"
+    #         )
+    #     return local_free_energy, chain_std
+
     def _record_epoch(self):
-        local_free_energy, energy, hatlambda, hatlambda_lower, hatlambda_upper = self.compute_fenergy_energy_rlct()
-        func_var = self.compute_functional_variance(
-            num_iter=self.sgld_num_iter,
-            num_chains=self.sgld_num_chains,
-            gamma=self.sgld_gamma,
-            epsilon=self.sgld_noise_std,
-        )
-        func_var = float(func_var.item())
-        nu = func_var / 2
-        self.records["lfe"].append(local_free_energy)
-        self.records["energy"].append(energy)
-        self.records["hatlambda"].append(hatlambda)
-        self.records["func_var"].append(func_var)
-        self.records["nu"].append(nu)
+        (
+            local_free_energy,
+            energy,
+            hatlambda,
+            hatlambda_lower,
+            hatlambda_upper,
+        ) = self.compute_fenergy_energy_rlct()
         test_err = 1 - self.eval(self.testloader)
         train_err = 1 - self.eval(self.trainloader)
 
-        self.records["test_error"].append(test_err)
-        self.records["train_error"].append(train_err)
-        self.records["hatlambda_lower"].append(hatlambda_lower)
-        self.records["hatlambda_upper"].append(hatlambda_upper)
+        # func_var = self.compute_functional_variance(
+        #     num_iter=self.sgld_num_iter,
+        #     num_chains=self.sgld_num_chains,
+        #     gamma=self.sgld_gamma,
+        #     epsilon=self.sgld_noise_std,
+        # )
+        # func_var = float(func_var.item())
+        # nu = func_var / 2
+        # self.save_to_epoch_record("func_var", func_var)
+        # self.save_to_epoch_record("nu", nu)
+
+        self.save_to_epoch_record("lfe", local_free_energy)
+        self.save_to_epoch_record("energy", energy)
+        self.save_to_epoch_record("hatlambda", hatlambda)
+        self.save_to_epoch_record("test_error", test_err)
+        self.save_to_epoch_record("train_error", train_err)
+        self.save_to_epoch_record("hatlambda_lower", hatlambda_lower)
+        self.save_to_epoch_record("hatlambda_upper", hatlambda_upper)
+
         epoch = len(self.records["test_error"])
         print(
             f"Epoch: {epoch} "
@@ -303,8 +352,6 @@ class Experiment(object):
 
     def run_entropy_sgd(self, esgd_L, num_epoch):
         print("Running Entropy-SGD optimizer")
-        # errors, lfes, energies, lmbdas = [], [], [], []
-
         for epoch in range(num_epoch):  # loop over the dataset multiple times
             start_time = time.time()
             for _ in range(len(self.trainloader) // esgd_L):
