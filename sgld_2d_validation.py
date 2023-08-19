@@ -92,7 +92,7 @@ def run_experiment(
             tempered_samples = experiment.run_mcmc(num_samples=num_steps, itemp=itemp)
         lambdahat = experiment.compute_lambdahat(tempered_samples, true_w=(0, 0))
         func_var = experiment.compute_functional_variance(tempered_samples)
-        sing_fluc_est = func_var / (2 * itemp)
+        sing_fluc_est = func_var * itemp / 2
         # lambdahat = experiment.compute_multitemp_lambdahat(trajectory)
         print(f"{sampler_type}, {monomial_exps}, {prior_exps}, itemp:{itemp:.4f}, lambdahat:{lambdahat:.4f}, lambda:{true_lambda:.4f}, nu:{sing_fluc_est}")
         
