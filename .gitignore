@@ -1,3 +1,9 @@
+outputs/
+data/
+images/
+.vscode/
+archive/
+*.DS_store*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
